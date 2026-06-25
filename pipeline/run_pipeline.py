@@ -275,6 +275,12 @@ def _compute_analytics(landmarks_df, features_df, predictions_df, fps, detected_
 
 
 def run_full_pipeline(video_path, model, encoder, progress_callback=None):
+    # Force MediaPipe to use CPU only — prevents GPU init crash on Streamlit Cloud.
+    # These must be set BEFORE mediapipe is imported (lazy import below ensures that).
+    import os as _os
+    _os.environ.setdefault("CUDA_VISIBLE_DEVICES", "-1")   # hide all GPUs from CUDA
+    _os.environ.setdefault("MEDIAPIPE_DISABLE_GPU", "1")   # MediaPipe-level GPU disable
+
     # Import mediapipe HERE (lazy) so module-level import never runs on Streamlit Cloud
     import mediapipe as mp
     mp_pose = mp.solutions.pose
@@ -324,7 +330,9 @@ def run_full_pipeline(video_path, model, encoder, progress_callback=None):
     with mp_pose.Pose(
         model_complexity=1,
         min_detection_confidence=0.3,
-        min_tracking_confidence=0.3
+        min_tracking_confidence=0.3,
+        enable_segmentation=False,   # skip GPU-heavy segmentation model
+        static_image_mode=False,     # video mode — more efficient on CPU
     ) as pose:
         frame_idx = 0
         while True:
