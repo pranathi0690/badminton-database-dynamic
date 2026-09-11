@@ -1,5 +1,6 @@
 import os
 import time
+import urllib.request
 import cv2
 import numpy as np
 import pandas as pd
@@ -7,35 +8,10 @@ import joblib
 import subprocess
 import imageio_ffmpeg
 
-# NOTE: This line is defense-in-depth only. It is NOT sufficient by itself —
-# Streamlit imports protobuf internally as soon as `import streamlit` runs,
-# which happens BEFORE this module is ever imported. By the time this line
-# executes, protobuf's implementation (python vs. the fast C++ "upb" backend)
-# is usually already locked in for the whole process, so setting the env var
-# here often has no effect.
-#
-# THE REAL FIX MUST BE IN YOUR MAIN ENTRY SCRIPT (e.g. streamlit_app.py /
-# app.py), as the very first lines, before `import streamlit`:
-#
-#     import os
-#     os.environ["PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION"] = "python"
-#     import streamlit as st
-#     ...
-#
-# AND pin compatible versions in requirements.txt:
-#     mediapipe==0.10.14
-#     protobuf==3.20.3
-#
-# Pinning protobuf to 3.20.3 is the part that actually guarantees this bug
-# can't happen, because the "upb" backend that breaks MediaPipe's legacy
-# Solutions API didn't exist before protobuf 4.x. The env var above is just
-# a second safety net in case some other dependency pulls in a newer
-# protobuf anyway.
+# Defense-in-depth only — harmless to keep, not required for this fix to work.
 os.environ.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
 
-# NOTE: mediapipe is imported LAZILY inside run_full_pipeline() only,
-# NOT at module level. This prevents the "module has no attribute solutions"
-# crash on Streamlit Cloud where mediapipe loads differently.
+# NOTE: mediapipe is imported LAZILY inside run_full_pipeline() only.
 
 MODEL_JOINTS = [
     "left_shoulder", "right_shoulder", "left_hip", "right_hip",
@@ -58,6 +34,51 @@ SKELETON_EDGES = [
 ]
 
 RF_MODEL_PATH = "data/rf.pkl"
+
+# ── MediaPipe Tasks API (PoseLandmarker) setup ──────────────────────────────
+# This replaces the legacy `mp.solutions.pose` Solutions API entirely.
+# The Tasks API does NOT use the calculator-options field-descriptor
+# reflection that the legacy API relies on — the exact code path that
+# throws "'FieldDescriptor' object has no attribute 'label'" under newer
+# protobuf builds. Switching APIs removes the bug at its source instead of
+# fighting protobuf version/implementation timing.
+#
+# BlazePose topology used by both the old and new MediaPipe pose APIs is
+# identical (33 landmarks, same indices), so this mapping is hardcoded here
+# rather than pulled from mp.solutions.pose.PoseLandmark.
+POSE_LANDMARK_INDEX = {
+    "nose": 0,
+    "left_shoulder": 11, "right_shoulder": 12,
+    "left_elbow": 13, "right_elbow": 14,
+    "left_wrist": 15, "right_wrist": 16,
+    "left_hip": 23, "right_hip": 24,
+    "left_knee": 25, "right_knee": 26,
+    "left_ankle": 27, "right_ankle": 28,
+    "left_foot": 31, "right_foot": 32,
+}
+
+POSE_MODEL_PATH = "data/pose_landmarker_lite.task"
+POSE_MODEL_URL = (
+    "https://storage.googleapis.com/mediapipe-models/pose_landmarker/"
+    "pose_landmarker_lite/float16/latest/pose_landmarker_lite.task"
+)
+
+
+def _ensure_pose_model():
+    """Downloads the PoseLandmarker model bundle once, if not already present."""
+    if not os.path.exists(POSE_MODEL_PATH):
+        os.makedirs(os.path.dirname(POSE_MODEL_PATH), exist_ok=True)
+        try:
+            urllib.request.urlretrieve(POSE_MODEL_URL, POSE_MODEL_PATH)
+        except Exception as e:
+            raise RuntimeError(
+                f"Could not download the MediaPipe PoseLandmarker model from "
+                f"{POSE_MODEL_URL}. Check that Streamlit Cloud has outbound "
+                f"internet access, or commit the .task file directly into "
+                f"the '{os.path.dirname(POSE_MODEL_PATH)}' folder of your repo "
+                f"instead. Original error: {e}"
+            ) from e
+    return POSE_MODEL_PATH
 
 
 def load_model_and_encoder():
@@ -171,25 +192,6 @@ def _build_model_features(landmarks_df: pd.DataFrame, fps: float) -> pd.DataFram
     return f
 
 
-# ── _compute_analytics — PATCHED ────────────────────────────────────────────
-# Three bugs fixed here so identity_section.py / tactical_section.py /
-# alerts.py / coach_report.py work correctly on uploaded videos:
-#
-#   1. top_strengths / top_weaknesses were plain strings ("speed", "stability").
-#      identity_section.py and tactical_section.py both do `s["metric"]` /
-#      `s["score"]` on these — that's a TypeError on a plain string. Now
-#      shaped as {"metric": ..., "score": ...} dicts, matching demo analytics.json.
-#
-#   2. court_zone_coverage was RAW FRAME COUNTS with 0-indexed zone keys
-#      ("0".."8"). identity_section.py's ZONE_LABELS / ZONE_DEPTH and
-#      tactical_section.py's ZONE_DEPTH both expect PERCENTAGES with
-#      1-indexed keys ("1".."9"). Without this fix, every zone lookup
-#      silently misses and "Court Preference" / depth breakdowns show
-#      all-zero / "Unknown" even on a perfectly good upload.
-#
-#   3. avg_recovery_distance and avg_stance_width were missing entirely —
-#      identity_section.py's determine_style_tags() and coach_report.py's
-#      generate_recovery_recommendations() both read these fields directly.
 def _compute_analytics(landmarks_df, features_df, predictions_df, fps, detected_frame_count):
     total_frames = len(landmarks_df)
     duration = total_frames / fps if fps else 0
@@ -217,8 +219,6 @@ def _compute_analytics(landmarks_df, features_df, predictions_df, fps, detected_
     backhand_pct     = round(backhand_frames  / total_frames * 100, 1) if total_frames else 0
     recovery_ratio   = recovery_frames / total_frames if total_frames else 0
 
-    # FIX #2: percentages + 1-indexed keys ("1".."9"), matching the
-    # ZONE_LABELS / ZONE_DEPTH maps used elsewhere in the dashboard.
     zone_counts_0idx = features_df["court_zone"].value_counts()
     zone_total = zone_counts_0idx.sum()
     zone_coverage = {
@@ -226,9 +226,6 @@ def _compute_analytics(landmarks_df, features_df, predictions_df, fps, detected_
         for zone, count in zone_counts_0idx.items()
     } if zone_total else {}
 
-    # Use scoring_engine + grade_engine as the single source of truth for
-    # BPS and grade — same formula the Performance section uses, so all
-    # sections (Alerts, Tactical, Coach Report, Performance) agree.
     from utils.scoring_engine import run_full_performance_analysis
     from utils.grade_engine import compute_grade
 
@@ -286,8 +283,8 @@ def _compute_analytics(landmarks_df, features_df, predictions_df, fps, detected_
         "total_distance":        total_distance,
         "avg_path_efficiency":   round(avg_path_efficiency, 4),
         "avg_stability_index":   round(avg_stability, 4),
-        "avg_recovery_distance": round(avg_recovery_distance, 4),   # FIX #3
-        "avg_stance_width":      round(avg_stance_width, 4),         # FIX #3
+        "avg_recovery_distance": round(avg_recovery_distance, 4),
+        "avg_stance_width":      round(avg_stance_width, 4),
         "forehand_usage":        forehand_pct,
         "backhand_usage":        backhand_pct,
         "court_zone_coverage":   zone_coverage,
@@ -300,73 +297,48 @@ def _compute_analytics(landmarks_df, features_df, predictions_df, fps, detected_
     }
 
 
-def _init_pose_model(mp_pose):
+def _create_pose_landmarker(mp, mp_python, mp_vision):
     """
-    Wraps mp_pose.Pose(...) construction so that IF the protobuf/mediapipe
-    descriptor bug still occurs (i.e. the entry-script env var + requirements
-    pin described at the top of this file were not applied), the app fails
-    with a clear, actionable message instead of a bare AttributeError deep
-    inside mediapipe's internals.
+    Builds a PoseLandmarker using the Tasks API. This is the fix for the
+    'FieldDescriptor' object has no attribute 'label' crash — the Tasks API
+    never touches calculator-options field-descriptor reflection, so this
+    class of protobuf incompatibility cannot occur here regardless of which
+    protobuf build/implementation is installed.
     """
     try:
-        return mp_pose.Pose(
-            model_complexity=1,
-            min_detection_confidence=0.3,
+        base_options = mp_python.BaseOptions(model_asset_path=_ensure_pose_model())
+        options = mp_vision.PoseLandmarkerOptions(
+            base_options=base_options,
+            running_mode=mp_vision.RunningMode.VIDEO,
+            min_pose_detection_confidence=0.3,
             min_tracking_confidence=0.3,
-            enable_segmentation=False,   # skip GPU-heavy segmentation model
-            static_image_mode=False,     # video mode — more efficient on CPU
+            output_segmentation_masks=False,
         )
+        return mp_vision.PoseLandmarker.create_from_options(options)
     except AttributeError as e:
         if "label" in str(e) and "FieldDescriptor" in str(e):
             raise RuntimeError(
-                "MediaPipe failed to initialize because of a protobuf version "
-                "conflict (FieldDescriptor has no attribute 'label'). This is "
-                "NOT a bug in your pipeline code.\n\n"
-                "Fix (do BOTH):\n"
-                "1. In requirements.txt, pin:\n"
-                "     mediapipe==0.10.14\n"
-                "     protobuf==3.20.3\n"
-                "2. At the very top of your main Streamlit entry file "
-                "(before `import streamlit`), add:\n"
-                "     import os\n"
-                "     os.environ['PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION'] = 'python'\n"
-                "     import streamlit as st\n\n"
-                "Setting this only inside run_pipeline.py is too late — "
-                "Streamlit itself imports protobuf before this module ever runs.\n"
-                "After committing both changes, use 'Reboot app' (not just a "
-                "redeploy) on Streamlit Cloud to force a clean environment rebuild."
+                "MediaPipe still failed with the FieldDescriptor.label bug "
+                "even on the Tasks API. This means the installed mediapipe "
+                "build itself is broken/corrupted for this Python version. "
+                "Fix: in requirements.txt pin an exact known-good pair, e.g.\n"
+                "    mediapipe==0.10.14\n"
+                "    protobuf==4.25.3\n"
+                "then use 'Reboot app' (not just redeploy) on Streamlit Cloud, "
+                "or delete and redeploy the app fresh if rebooting reuses a "
+                "cached broken environment."
             ) from e
         raise
 
 
 def run_full_pipeline(video_path, model, encoder, progress_callback=None):
-    # Force MediaPipe to use CPU only — prevents GPU init crash on Streamlit Cloud.
-    # These must be set BEFORE mediapipe is imported (lazy import below ensures that).
     import os as _os
-    _os.environ.setdefault("CUDA_VISIBLE_DEVICES", "-1")   # hide all GPUs from CUDA
-    _os.environ.setdefault("MEDIAPIPE_DISABLE_GPU", "1")   # MediaPipe-level GPU disable
+    _os.environ.setdefault("CUDA_VISIBLE_DEVICES", "-1")
+    _os.environ.setdefault("MEDIAPIPE_DISABLE_GPU", "1")
 
-    # Import mediapipe HERE (lazy) so module-level import never runs on Streamlit Cloud
     import mediapipe as mp
-    mp_pose = mp.solutions.pose
-
-    LANDMARK_INDEX = {
-        "nose":           mp_pose.PoseLandmark.NOSE.value,
-        "left_shoulder":  mp_pose.PoseLandmark.LEFT_SHOULDER.value,
-        "right_shoulder": mp_pose.PoseLandmark.RIGHT_SHOULDER.value,
-        "left_elbow":     mp_pose.PoseLandmark.LEFT_ELBOW.value,
-        "right_elbow":    mp_pose.PoseLandmark.RIGHT_ELBOW.value,
-        "left_wrist":     mp_pose.PoseLandmark.LEFT_WRIST.value,
-        "right_wrist":    mp_pose.PoseLandmark.RIGHT_WRIST.value,
-        "left_hip":       mp_pose.PoseLandmark.LEFT_HIP.value,
-        "right_hip":      mp_pose.PoseLandmark.RIGHT_HIP.value,
-        "left_knee":      mp_pose.PoseLandmark.LEFT_KNEE.value,
-        "right_knee":     mp_pose.PoseLandmark.RIGHT_KNEE.value,
-        "left_ankle":     mp_pose.PoseLandmark.LEFT_ANKLE.value,
-        "right_ankle":    mp_pose.PoseLandmark.RIGHT_ANKLE.value,
-        "left_foot":      mp_pose.PoseLandmark.LEFT_FOOT_INDEX.value,
-        "right_foot":     mp_pose.PoseLandmark.RIGHT_FOOT_INDEX.value,
-    }
+    from mediapipe.tasks import python as mp_python
+    from mediapipe.tasks.python import vision as mp_vision
 
     run_id      = int(time.time() * 1000)
     output_path = f"video/uploaded_annotated_{run_id}.mp4"
@@ -382,6 +354,7 @@ def run_full_pipeline(video_path, model, encoder, progress_callback=None):
     w            = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     h            = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    frame_duration_ms = 1000.0 / fps
 
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter(skeleton_video_path, fourcc, fps, (w, h))
@@ -391,8 +364,9 @@ def run_full_pipeline(video_path, model, encoder, progress_callback=None):
     landmarks_rows      = []
     detected_frame_count = 0
 
-    # ── PASS 1: Pose detection + draw skeleton ─────────────────────────────
-    with _init_pose_model(mp_pose) as pose:
+    # ── PASS 1: Pose detection + draw skeleton (Tasks API) ─────────────────
+    landmarker = _create_pose_landmarker(mp, mp_python, mp_vision)
+    try:
         frame_idx = 0
         while True:
             ret, frame = cap.read()
@@ -403,16 +377,20 @@ def run_full_pipeline(video_path, model, encoder, progress_callback=None):
             scale = target_long_side / max(w, h)
             small = cv2.resize(frame, (int(w * scale), int(h * scale)))
             rgb   = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
-            result = pose.process(rgb)
+
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+            timestamp_ms = int(frame_idx * frame_duration_ms)
+            result = landmarker.detect_for_video(mp_image, timestamp_ms)
 
             row = {"frame": frame_idx}
             xs, ys   = [], []
             joint_px = {}
 
             if result.pose_landmarks:
+                # Single-player pipeline: take the first detected pose.
+                lm = result.pose_landmarks[0]
                 detected_frame_count += 1
-                lm = result.pose_landmarks.landmark
-                for name, idx in LANDMARK_INDEX.items():
+                for name, idx in POSE_LANDMARK_INDEX.items():
                     point = lm[idx]
                     row[f"{name}_x"] = point.x
                     row[f"{name}_y"] = point.y
@@ -441,6 +419,8 @@ def run_full_pipeline(video_path, model, encoder, progress_callback=None):
             frame_idx += 1
             if progress_callback:
                 progress_callback("Detecting pose", frame_idx, total_frames)
+    finally:
+        landmarker.close()
 
     cap.release()
     writer.release()
@@ -453,12 +433,10 @@ def run_full_pipeline(video_path, model, encoder, progress_callback=None):
 
     landmarks_df = pd.DataFrame(landmarks_rows)
 
-    # ── BATCH: Feature engineering ─────────────────────────────────────────
     if progress_callback:
         progress_callback("Computing movement features", 1, 1)
     features_df = _build_model_features(landmarks_df, fps)
 
-    # ── BATCH: RF prediction ───────────────────────────────────────────────
     predictions_rows  = []
     expected_features = list(getattr(model, "feature_names_in_", [])) if model else []
 
@@ -521,7 +499,6 @@ def run_full_pipeline(video_path, model, encoder, progress_callback=None):
     if os.path.exists(skeleton_video_path):
         os.remove(skeleton_video_path)
 
-    # ── Re-encode to H.264 for browser playback ────────────────────────────
     if progress_callback:
         progress_callback("Re-encoding for browser", 1, 1)
     _reencode_for_browser(temp_output, output_path)
@@ -535,7 +512,6 @@ def run_full_pipeline(video_path, model, encoder, progress_callback=None):
             "the writer or ffmpeg re-encode silently failed."
         )
 
-    # ── Compute analytics dict ─────────────────────────────────────────────
     if progress_callback:
         progress_callback("Computing analytics", 1, 1)
 
@@ -546,17 +522,16 @@ def run_full_pipeline(video_path, model, encoder, progress_callback=None):
     label_counts     = predictions_df["prediction"].value_counts().to_dict()
     label_confidence = predictions_df.groupby("prediction")["confidence"].mean().to_dict()
 
-    # ── Return everything with CORRECT key names ───────────────────────────
     return {
         "annotated_video_path":  output_path,
         "total_frames":          len(landmarks_df),
         "detected_frame_count":  detected_frame_count,
         "label_counts":          label_counts,
         "label_confidence":      label_confidence,
-        "landmarks_df":          landmarks_df,       # used by upload_section
-        "predictions_df":        predictions_df,     # used by upload_section
-        "features_df":           features_df,        # used by upload_section
-        "analytics":             analytics_dict,     # used by upload_section
+        "landmarks_df":          landmarks_df,
+        "predictions_df":        predictions_df,
+        "features_df":           features_df,
+        "analytics":             analytics_dict,
     }
 
 
