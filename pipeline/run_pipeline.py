@@ -7,6 +7,32 @@ import joblib
 import subprocess
 import imageio_ffmpeg
 
+# NOTE: This line is defense-in-depth only. It is NOT sufficient by itself —
+# Streamlit imports protobuf internally as soon as `import streamlit` runs,
+# which happens BEFORE this module is ever imported. By the time this line
+# executes, protobuf's implementation (python vs. the fast C++ "upb" backend)
+# is usually already locked in for the whole process, so setting the env var
+# here often has no effect.
+#
+# THE REAL FIX MUST BE IN YOUR MAIN ENTRY SCRIPT (e.g. streamlit_app.py /
+# app.py), as the very first lines, before `import streamlit`:
+#
+#     import os
+#     os.environ["PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION"] = "python"
+#     import streamlit as st
+#     ...
+#
+# AND pin compatible versions in requirements.txt:
+#     mediapipe==0.10.14
+#     protobuf==3.20.3
+#
+# Pinning protobuf to 3.20.3 is the part that actually guarantees this bug
+# can't happen, because the "upb" backend that breaks MediaPipe's legacy
+# Solutions API didn't exist before protobuf 4.x. The env var above is just
+# a second safety net in case some other dependency pulls in a newer
+# protobuf anyway.
+os.environ.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
+
 # NOTE: mediapipe is imported LAZILY inside run_full_pipeline() only,
 # NOT at module level. This prevents the "module has no attribute solutions"
 # crash on Streamlit Cloud where mediapipe loads differently.
@@ -274,6 +300,45 @@ def _compute_analytics(landmarks_df, features_df, predictions_df, fps, detected_
     }
 
 
+def _init_pose_model(mp_pose):
+    """
+    Wraps mp_pose.Pose(...) construction so that IF the protobuf/mediapipe
+    descriptor bug still occurs (i.e. the entry-script env var + requirements
+    pin described at the top of this file were not applied), the app fails
+    with a clear, actionable message instead of a bare AttributeError deep
+    inside mediapipe's internals.
+    """
+    try:
+        return mp_pose.Pose(
+            model_complexity=1,
+            min_detection_confidence=0.3,
+            min_tracking_confidence=0.3,
+            enable_segmentation=False,   # skip GPU-heavy segmentation model
+            static_image_mode=False,     # video mode — more efficient on CPU
+        )
+    except AttributeError as e:
+        if "label" in str(e) and "FieldDescriptor" in str(e):
+            raise RuntimeError(
+                "MediaPipe failed to initialize because of a protobuf version "
+                "conflict (FieldDescriptor has no attribute 'label'). This is "
+                "NOT a bug in your pipeline code.\n\n"
+                "Fix (do BOTH):\n"
+                "1. In requirements.txt, pin:\n"
+                "     mediapipe==0.10.14\n"
+                "     protobuf==3.20.3\n"
+                "2. At the very top of your main Streamlit entry file "
+                "(before `import streamlit`), add:\n"
+                "     import os\n"
+                "     os.environ['PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION'] = 'python'\n"
+                "     import streamlit as st\n\n"
+                "Setting this only inside run_pipeline.py is too late — "
+                "Streamlit itself imports protobuf before this module ever runs.\n"
+                "After committing both changes, use 'Reboot app' (not just a "
+                "redeploy) on Streamlit Cloud to force a clean environment rebuild."
+            ) from e
+        raise
+
+
 def run_full_pipeline(video_path, model, encoder, progress_callback=None):
     # Force MediaPipe to use CPU only — prevents GPU init crash on Streamlit Cloud.
     # These must be set BEFORE mediapipe is imported (lazy import below ensures that).
@@ -327,13 +392,7 @@ def run_full_pipeline(video_path, model, encoder, progress_callback=None):
     detected_frame_count = 0
 
     # ── PASS 1: Pose detection + draw skeleton ─────────────────────────────
-    with mp_pose.Pose(
-        model_complexity=1,
-        min_detection_confidence=0.3,
-        min_tracking_confidence=0.3,
-        enable_segmentation=False,   # skip GPU-heavy segmentation model
-        static_image_mode=False,     # video mode — more efficient on CPU
-    ) as pose:
+    with _init_pose_model(mp_pose) as pose:
         frame_idx = 0
         while True:
             ret, frame = cap.read()
