@@ -14,8 +14,9 @@ ARCHITECTURE:
     passed in explicitly (scoring_engine.py takes a DataFrame, not a
     session lookup) — handled below via get_active_features().
 """
-
 import os
+# MUST be set BEFORE importing MediaPipe
+os.environ["PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION"] = "python"
 import json
 import pandas as pd
 import streamlit as st
